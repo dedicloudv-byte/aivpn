@@ -1,15 +1,14 @@
-# AIVPN - VLESS & Trojan on Cloudflare Workers
+# AIVPN - V2Ray Relay Manager on Cloudflare Workers
 
-A high-performance VLESS and Trojan implementation on Cloudflare Workers with a modern, V2Ray-style dashboard.
+AIVPN is a powerful Cloudflare Worker application that acts as a web-based client and relay manager for your VLESS and Trojan accounts. It allows you to manage multiple servers and relay them through Cloudflare's network for better privacy and connectivity.
 
 ## Features
-- **VLESS Protocol**: WebSocket + TLS support.
-- **Trojan Protocol**: WebSocket + TLS support.
-- **Modern Dashboard**: Built-in web UI served directly from the worker.
-- **Auto-Config**: Generates `vless://` and `trojan://` links automatically.
-- **QR Codes**: Scan directly from the dashboard to your mobile app.
-- **Cloudflare Sockets**: Uses the latest `cloudflare:sockets` API for better performance.
-- **Secure**: Authentication included for both protocols.
+- **Modern Web Dashboard**: A UI inspired by v2rayNG for managing your proxy accounts.
+- **Relay Support**: Bridge your existing VLESS/Trojan accounts through Cloudflare.
+- **Protocol Support**: Handles VLESS and Trojan over WebSocket.
+- **Subscription Support**: Import server lists directly from subscription URLs.
+- **Connection Testing**: Test latency from the worker to your remote servers.
+- **Privacy**: Accounts are stored locally in your browser (`localStorage`).
 
 ## Quick Start (Deployment)
 
@@ -18,37 +17,22 @@ A high-performance VLESS and Trojan implementation on Cloudflare Workers with a 
 2. Go to **Workers & Pages** -> **Create application** -> **Create Worker**.
 3. Name your worker (e.g., `aivpn`) and click **Deploy**.
 4. Click **Edit Code**.
-5. Copy the entire content of `index.js` from this repository and paste it into the Cloudflare editor, replacing all existing code.
+5. Copy the entire content of `index.js` from this repository and paste it into the Cloudflare editor.
 6. Click **Save and Deploy**.
 
-### Method 2: Wrangler CLI (Recommended)
-1. Install [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/): `npm install -g wrangler`
-2. Login to your account: `wrangler login`
-3. Edit `wrangler.toml` to customize your `UUID` and `PASSWORD`.
-4. Deploy the worker: `wrangler deploy`
+### Method 2: Wrangler CLI
+1. Install [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
+2. Run `wrangler deploy` in this directory.
 
-## Configuration (Optional)
+## How to Use
+1. Access your worker URL (e.g., `https://aivpn.yourname.workers.dev`).
+2. Click **Add Server** and paste your VLESS/Trojan link.
+3. Use the **Relay** button to generate a new config that tunnels through this worker.
+4. Import the generated relay config into your favorite client (v2rayNG, v2rayN, Shadowrocket, etc.).
 
-You can customize your credentials by adding environment variables in the Cloudflare Worker settings or in `wrangler.toml`:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `UUID` | Your VLESS User ID (UUID) | `7a7a7a7a-7a7a-7a7a-7a7a-7a7a7a7a7a7a` |
-| `PASSWORD` | Trojan Password (used for Dashboard UI) | `aivpn` |
-| `PASSWORD_HASH` | SHA224 Hash of your Trojan Password | (Hash of 'aivpn') |
-
-To add these via Web Interface:
-1. Go to your Worker's dashboard.
-2. Go to **Settings** -> **Variables**.
-3. Add the variables under **Environment Variables**.
-4. Redeploy the worker.
-
-## Client Support
-This worker is compatible with all major V2Ray clients:
-- **Android**: v2rayNG
-- **iOS**: Shadowrocket, Stash, V2Box
-- **Windows**: v2rayN
-- **macOS**: V2RayXS, Clash Verge
+## Security
+- This worker can be used as a public relay if the URL is known.
+- To restrict access, you can add a `PASSWORD` environment variable (feature coming soon) or use Cloudflare Access.
 
 ## License
 MIT
