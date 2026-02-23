@@ -1,0 +1,13 @@
+name = "aivpn"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+UUID = "7a7a7a7a-7a7a-7a7a-7a7a-7a7a7a7a7a7a"
+PASSWORD = "aivpn"
+PASSWORD_HASH = "394205562d989938b29df95107e3ef74421b93f2183c5093153ee046"
+
+# Optional: Add your custom domain here
+# [[routes]]
+# pattern = "vpn.yourdomain.com"
+# custom_domain = true
