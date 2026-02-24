@@ -1,5 +1,5 @@
 // AIVPN - Cloudflare Worker V2Ray Client Dashboard & Relay
-// v2.4.0 - Added Quick Config Generator & Short Relay Paths
+// v2.4.2 - Corrected VLESS protocol parsing & 1101 fixes
 
 import { connect } from 'cloudflare:sockets';
 
@@ -80,13 +80,30 @@ async function handleRelay(request, nauticaMatch) {
   const url = new URL(request.url);
   let targetHost, targetPort;
 
-  if (nauticaMatch) {
-    targetHost = nauticaMatch[1];
-    targetPort = parseInt(nauticaMatch[2]);
-  } else {
-    const parts = url.pathname.split('/').filter(Boolean);
-    targetHost = parts[1];
-    targetPort = parseInt(parts[2]);
+  try {
+    if (nauticaMatch) {
+      targetHost = nauticaMatch[1];
+      targetPort = parseInt(nauticaMatch[2]);
+    } else {
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts.length < 2) throw new Error('Invalid relay path format');
+
+      const hostPart = parts[1];
+      if (hostPart.includes(':')) {
+        const hParts = hostPart.split(':');
+        targetHost = hParts[0];
+        targetPort = parseInt(hParts[1]);
+      } else {
+        targetHost = hostPart;
+        targetPort = parseInt(parts[2] || '443');
+      }
+    }
+
+    if (!targetHost || isNaN(targetPort)) {
+      throw new Error(`Invalid host (${targetHost}) or port (${targetPort})`);
+    }
+  } catch (e) {
+    return new Response(e.message, { status: 400 });
   }
 
   const webSocketPair = new WebSocketPair();
@@ -130,6 +147,8 @@ async function handleDirect(request, env) {
   server.addEventListener('message', async (event) => {
     try {
       const buffer = event.data;
+      if (buffer.byteLength < 24) return;
+
       let address = '', port = 0, addressEnd = 0, version = 0;
 
       if (url.pathname === '/trojan') {
@@ -137,20 +156,43 @@ async function handleDirect(request, env) {
           const view = new DataView(buffer);
           const addressType = view.getUint8(59);
           let offset = 60;
-          if (addressType === 1) { address = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4; }
-          else if (addressType === 2) { const len = view.getUint8(offset); offset += 1; address = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len; }
+          if (addressType === 1) {
+              address = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4;
+          } else if (addressType === 2) {
+              const len = view.getUint8(offset); offset += 1;
+              address = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len;
+          } else if (addressType === 3) {
+              const ipv6 = [];
+              for (let i = 0; i < 8; i++) { ipv6.push(view.getUint16(offset + i * 2).toString(16)); }
+              address = ipv6.join(':'); offset += 16;
+          }
           port = view.getUint16(offset);
-          addressEnd = offset + 4;
+          addressEnd = offset + 2;
       } else {
-          if (buffer.byteLength < 24) return;
           version = new Uint8Array(buffer.slice(0, 1))[0];
           const optLength = new Uint8Array(buffer.slice(17, 18))[0];
-          port = new DataView(buffer.slice(19 + optLength, 21 + optLength)).getUint16(0);
-          const addressType = new Uint8Array(buffer.slice(21 + optLength, 22 + optLength))[0];
-          addressEnd = 22 + optLength;
-          if (addressType === 1) { address = new Uint8Array(buffer.slice(addressEnd, addressEnd + 4)).join('.'); addressEnd += 4; }
-          else if (addressType === 2) { const len = new Uint8Array(buffer.slice(addressEnd, addressEnd + 1))[0]; addressEnd += 1; address = new TextDecoder().decode(buffer.slice(addressEnd, addressEnd + len)); addressEnd += len; }
+          const view = new DataView(buffer);
+
+          // VLESS: [1]Version [16]UUID [1]OptLen [N]Options [1]CMD [2]Port [1]AddrType [M]Address
+          const cmd = view.getUint8(18 + optLength);
+          port = view.getUint16(19 + optLength);
+          const addressType = view.getUint8(21 + optLength);
+          let offset = 22 + optLength;
+
+          if (addressType === 1) {
+              address = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4;
+          } else if (addressType === 2) {
+              const len = view.getUint8(offset); offset += 1;
+              address = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len;
+          } else if (addressType === 3) {
+              const ipv6 = [];
+              for (let i = 0; i < 8; i++) { ipv6.push(view.getUint16(offset + i * 2).toString(16)); }
+              address = ipv6.join(':'); offset += 16;
+          }
+          addressEnd = offset;
       }
+
+      if (!address || !port) throw new Error('Failed to parse address or port');
 
       const tcpSocket = connect({ hostname: address, port: port });
       if (url.pathname !== '/trojan') server.send(new Uint8Array([version, 0]));
@@ -371,7 +413,7 @@ function generateDashboard(request) {
 
             const uuid = '00000000-0000-0000-0000-000000000000'; // Default or from env
             const path = encodeURIComponent('/' + host + ':' + port);
-            const link = \`\${proto}://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-\${host}\`;
+            const link = \`\${proto}://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-Relay\`;
 
             display.innerText = link;
             qrContainer.innerHTML = '';
@@ -479,18 +521,35 @@ function generateDashboard(request) {
         async function conn(id) {
             const s = servers.find(x => x.id === id); if(!s) return;
             addLog(\`Initializing secure tunnel to \${s.alias}...\`);
-            addLog(\`Resolving DNS for \${s.host}...\`);
+            addLog(\`Connecting to \${s.host}:\${s.port}...\`);
             activeId = id; localStorage.setItem('aivpn_act_v5', id); render();
             try {
-                const res = await fetch('/api/test', { method: 'POST', body: JSON.stringify({ host: s.host, port: s.port }) });
+                const res = await fetch('/api/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ host: s.host, port: s.port })
+                });
+
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(errText || 'Connection failed');
+                }
+
                 const data = await res.json();
                 if(data.success) {
                     addLog(\`TCP Connection established in \${data.latency}ms\`, 'success');
                     addLog(\`Protocol Handshake (\${s.protocol.toUpperCase()}) verified\`, 'success');
-                    addLog(\`Relay Route: https://\${workerHost}/relay/\${s.host}/\${s.port}\`);
+                    addLog(\`Relay Route: https://\${workerHost}/\${s.host}:\${s.port}\`);
                     await refreshIP();
-                } else { addLog(\`Handshake Failed: \${data.error}\`, 'error'); }
-            } catch (e) { addLog(\`Connection Timeout\`, 'error'); }
+                } else {
+                    addLog(\`Handshake Failed: \${data.error}\`, 'error');
+                    activeId = null;
+                }
+            } catch (e) {
+                addLog(\`Connection Error: \${e.message}\`, 'error');
+                activeId = null;
+            }
+            render();
             save();
         }
 
@@ -522,7 +581,7 @@ function generateDashboard(request) {
         function delSub(u) { subs = subs.filter(x => x !== u); saveSubs(); }
 
         refreshIP();
-        addLog('AIVPN Engine v2.4.0 started successfully.', 'success');
+        addLog('AIVPN Engine v2.4.2 started successfully.', 'success');
         render(); renderSubs();
     </script>
 </body>
