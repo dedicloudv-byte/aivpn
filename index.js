@@ -1,5 +1,5 @@
 // AIVPN - Cloudflare Worker V2Ray Client Dashboard & Relay
-// v2.5.0 - Unified Stream Architecture & Stability Fixes
+// v2.5.1 - Added Auto-UUID Generation in Config Generator
 
 import { connect } from 'cloudflare:sockets';
 
@@ -236,7 +236,7 @@ function generateDashboard(request) {
                 <p class="text-xs font-mono text-white truncate mb-1" id="client-ip-display">Detecting...</p>
                 <button onclick="refreshIP()" class="w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-[10px] font-black uppercase mt-2">Refresh</button>
             </div>
-            <div class="mt-6 text-[9px] font-bold text-slate-600 text-center uppercase">AIVPN EDGE CORE v2.5.0</div>
+            <div class="mt-6 text-[9px] font-bold text-slate-600 text-center uppercase">AIVPN EDGE CORE v2.5.1</div>
         </div>
     </aside>
 
@@ -259,6 +259,10 @@ function generateDashboard(request) {
                         </select>
                         <input type="text" id="gen-host" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-mono" placeholder="Proxy Host (e.g. sg1.node.com)">
                         <input type="number" id="gen-port" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-mono" placeholder="443" value="443">
+                        <div class="flex gap-2">
+                            <input type="text" id="gen-uuid" oninput="updateGen()" class="flex-1 bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-mono text-xs" placeholder="UUID / Password">
+                            <button onclick="regenUUID()" class="bg-slate-800 hover:bg-slate-700 px-4 rounded-2xl text-sky-400 transition-all"><i class="fas fa-sync-alt"></i></button>
+                        </div>
                     </div>
                 </div>
                 <div class="glass p-10 rounded-[3rem] flex flex-col items-center justify-center">
@@ -339,15 +343,34 @@ function generateDashboard(request) {
             const proto = document.getElementById('gen-proto').value;
             const host = document.getElementById('gen-host').value.trim();
             const port = document.getElementById('gen-port').value || '443';
+            const uuidField = document.getElementById('gen-uuid');
             const display = document.getElementById('gen-link');
             const qrContainer = document.getElementById('gen-qrcode');
-            if (!host) { display.innerText = 'Enter host...'; qrContainer.innerHTML = ''; return; }
-            const uuid = '00000000-0000-0000-0000-000000000000';
+
+            if (!uuidField.value) regenUUID();
+            const uuid = uuidField.value;
+
+            if (!host) {
+                display.innerText = 'Enter host...';
+                qrContainer.innerHTML = '';
+                return;
+            }
+
             const path = encodeURIComponent('/' + host + ':' + port);
             const link = \`\${proto}://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-Relay\`;
+
             display.innerText = link;
             qrContainer.innerHTML = '';
             new QRCode(qrContainer, { text: link, width: 200, height: 200 });
+        }
+
+        function regenUUID() {
+            const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+            document.getElementById('gen-uuid').value = uuid;
+            updateGen();
         }
 
         function copyGenLink() { navigator.clipboard.writeText(document.getElementById('gen-link').innerText); addLog('Link copied', 'success'); }
@@ -480,7 +503,7 @@ function generateDashboard(request) {
         function delSub(u) { subs = subs.filter(x => x !== u); saveSubs(); }
 
         refreshIP();
-        addLog('AIVPN Engine v2.5.0 started.', 'success');
+        addLog('AIVPN Engine v2.5.1 started.', 'success');
         render(); renderSubs();
 
         (async () => {
