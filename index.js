@@ -1,5 +1,5 @@
 // AIVPN - Cloudflare Worker V2Ray Client Dashboard & Relay
-// v2.3.1 - UI Fixes for Sidebar Visibility
+// v2.4.0 - Added Quick Config Generator & Short Relay Paths
 
 import { connect } from 'cloudflare:sockets';
 
@@ -10,8 +10,9 @@ export default {
       const upgradeHeader = request.headers.get('Upgrade');
 
       if (upgradeHeader === 'websocket') {
-        if (url.pathname.startsWith('/relay/')) {
-          return await handleRelay(request);
+        const nauticaMatch = url.pathname.match(/^\/([^\/]+)[:=-](\d+)$/);
+        if (url.pathname.startsWith('/relay/') || nauticaMatch) {
+          return await handleRelay(request, nauticaMatch);
         }
         return await handleDirect(request, env);
       }
@@ -75,11 +76,18 @@ async function handleFetchSubscription(request) {
   }
 }
 
-async function handleRelay(request) {
+async function handleRelay(request, nauticaMatch) {
   const url = new URL(request.url);
-  const parts = url.pathname.split('/').filter(Boolean);
-  const targetHost = parts[1];
-  const targetPort = parseInt(parts[2]);
+  let targetHost, targetPort;
+
+  if (nauticaMatch) {
+    targetHost = nauticaMatch[1];
+    targetPort = parseInt(nauticaMatch[2]);
+  } else {
+    const parts = url.pathname.split('/').filter(Boolean);
+    targetHost = parts[1];
+    targetPort = parseInt(parts[2]);
+  }
 
   const webSocketPair = new WebSocketPair();
   const [client, server] = Object.values(webSocketPair);
@@ -203,6 +211,7 @@ function generateDashboard(request) {
             </div>
             <nav class="space-y-4">
                 <button onclick="showSection('servers')" class="sidebar-item w-full flex items-center space-x-4 p-4 rounded-xl transition-all active" id="nav-servers"><i class="fas fa-server"></i><span class="font-bold">Configs</span></button>
+                <button onclick="showSection('gen')" class="sidebar-item w-full flex items-center space-x-4 p-4 rounded-xl transition-all" id="nav-gen"><i class="fas fa-magic"></i><span class="font-bold">Generator</span></button>
                 <button onclick="showSection('subs')" class="sidebar-item w-full flex items-center space-x-4 p-4 rounded-xl transition-all" id="nav-subs"><i class="fas fa-rss"></i><span class="font-bold">Subscriptions</span></button>
                 <button onclick="showSection('logs')" class="sidebar-item w-full flex items-center space-x-4 p-4 rounded-xl transition-all" id="nav-logs"><i class="fas fa-terminal"></i><span class="font-bold">System Logs</span></button>
             </nav>
@@ -235,6 +244,41 @@ function generateDashboard(request) {
         </header>
 
         <section id="section-servers" class="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-8"></section>
+
+        <section id="section-gen" class="hidden max-w-5xl mx-auto">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-12">
+                <div class="glass p-10 rounded-[3rem] space-y-8">
+                    <h3 class="text-2xl font-black flex items-center"><i class="fas fa-cog mr-4 text-sky-400"></i>Relay Settings</h3>
+                    <div class="space-y-6">
+                        <div>
+                            <label class="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-3 block">Protocol</label>
+                            <select id="gen-proto" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 focus:outline-none focus:border-sky-500 text-white font-bold appearance-none cursor-pointer">
+                                <option value="vless">VLESS (Recommended)</option>
+                                <option value="trojan">Trojan</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-3 block">Proxy Host (IP or Domain)</label>
+                            <input type="text" id="gen-host" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 focus:outline-none focus:border-sky-500 text-white font-mono" placeholder="e.g. 1.1.1.1 or sg1.v2ray.com">
+                        </div>
+                        <div>
+                            <label class="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-3 block">Proxy Port</label>
+                            <input type="number" id="gen-port" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 focus:outline-none focus:border-sky-500 text-white font-mono" placeholder="443" value="443">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass p-10 rounded-[3rem] flex flex-col items-center text-center justify-center">
+                    <div id="gen-qrcode-container" class="bg-white p-6 rounded-[2.5rem] shadow-2xl mb-8">
+                        <div id="gen-qrcode"></div>
+                    </div>
+                    <div class="w-full space-y-4">
+                        <div id="gen-link" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[10px] font-mono text-slate-400 break-all leading-relaxed h-20 overflow-y-auto">Enter host to generate link...</div>
+                        <button onclick="copyGenLink()" class="w-full bg-sky-600 hover:bg-sky-500 py-4 rounded-2xl font-black uppercase tracking-widest text-sm transition-all shadow-lg shadow-sky-600/20">Copy Config Link</button>
+                    </div>
+                </div>
+            </div>
+        </section>
 
         <section id="section-subs" class="hidden space-y-8 max-w-4xl">
             <div class="glass p-8 rounded-[2rem]">
@@ -295,14 +339,51 @@ function generateDashboard(request) {
         function clearLogs() { document.getElementById('log-container').innerHTML = ''; }
 
         function showSection(s) {
-            ['servers', 'subs', 'logs'].forEach(x => {
-                document.getElementById('section-'+x).classList.add('hidden');
-                document.getElementById('nav-'+x).classList.remove('active');
+            ['servers', 'gen', 'subs', 'logs'].forEach(x => {
+                const el = document.getElementById('section-'+x);
+                const nav = document.getElementById('nav-'+x);
+                if(el) el.classList.add('hidden');
+                if(nav) nav.classList.remove('active');
             });
-            document.getElementById('section-'+s).classList.remove('hidden');
-            document.getElementById('nav-'+s).classList.add('active');
-            const titles = { servers: 'Servers', subs: 'Subscriptions', logs: 'Live Console' };
+            const target = document.getElementById('section-'+s);
+            const navTarget = document.getElementById('nav-'+s);
+            if(target) target.classList.remove('hidden');
+            if(navTarget) navTarget.classList.add('active');
+            const titles = { servers: 'Servers', gen: 'Generator', subs: 'Subscriptions', logs: 'Live Console' };
+            const descs = { servers: 'Your private gateway to the global internet', gen: 'Quickly generate relay configurations', subs: 'Manage your remote config feeds', logs: 'Real-time protocol handshake monitoring' };
             document.getElementById('title').innerText = titles[s];
+            document.getElementById('desc').innerText = descs[s];
+        }
+
+        let genQr = null;
+        function updateGen() {
+            const proto = document.getElementById('gen-proto').value;
+            const host = document.getElementById('gen-host').value.trim();
+            const port = document.getElementById('gen-port').value || '443';
+            const display = document.getElementById('gen-link');
+            const qrContainer = document.getElementById('gen-qrcode');
+
+            if (!host) {
+                display.innerText = 'Enter host to generate link...';
+                qrContainer.innerHTML = '';
+                return;
+            }
+
+            const uuid = '00000000-0000-0000-0000-000000000000'; // Default or from env
+            const path = encodeURIComponent('/' + host + ':' + port);
+            const link = \`\${proto}://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-\${host}\`;
+
+            display.innerText = link;
+            qrContainer.innerHTML = '';
+            new QRCode(qrContainer, { text: link, width: 200, height: 200 });
+        }
+
+        function copyGenLink() {
+            const link = document.getElementById('gen-link').innerText;
+            if (link.includes('://')) {
+                navigator.clipboard.writeText(link);
+                addLog('Generator link copied', 'success');
+            }
         }
 
         function openModal(m) { document.getElementById(m+'-modal').classList.remove('hidden'); }
@@ -441,7 +522,7 @@ function generateDashboard(request) {
         function delSub(u) { subs = subs.filter(x => x !== u); saveSubs(); }
 
         refreshIP();
-        addLog('AIVPN Engine v2.3.1 started successfully.', 'success');
+        addLog('AIVPN Engine v2.4.0 started successfully.', 'success');
         render(); renderSubs();
     </script>
 </body>
