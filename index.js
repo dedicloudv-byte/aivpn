@@ -1,5 +1,5 @@
 // AIVPN - Cloudflare Worker V2Ray Client Dashboard & Relay
-// v2.5.1 - Added Auto-UUID Generation in Config Generator
+// v2.5.2 - Multi-protocol Generator UI
 
 import { connect } from 'cloudflare:sockets';
 
@@ -236,7 +236,7 @@ function generateDashboard(request) {
                 <p class="text-xs font-mono text-white truncate mb-1" id="client-ip-display">Detecting...</p>
                 <button onclick="refreshIP()" class="w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-[10px] font-black uppercase mt-2">Refresh</button>
             </div>
-            <div class="mt-6 text-[9px] font-bold text-slate-600 text-center uppercase">AIVPN EDGE CORE v2.5.1</div>
+            <div class="mt-6 text-[9px] font-bold text-slate-600 text-center uppercase">AIVPN EDGE CORE v2.5.2</div>
         </div>
     </aside>
 
@@ -248,27 +248,44 @@ function generateDashboard(request) {
 
         <section id="section-servers" class="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-8"></section>
 
-        <section id="section-gen" class="hidden max-w-5xl mx-auto">
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-12">
-                <div class="glass p-10 rounded-[3rem] space-y-8">
-                    <h3 class="text-2xl font-black"><i class="fas fa-cog mr-4 text-sky-400"></i>Relay Settings</h3>
-                    <div class="space-y-6">
-                        <select id="gen-proto" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-bold appearance-none">
-                            <option value="vless">VLESS</option>
-                            <option value="trojan">Trojan</option>
-                        </select>
-                        <input type="text" id="gen-host" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-mono" placeholder="Proxy Host (e.g. sg1.node.com)">
-                        <input type="number" id="gen-port" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-mono" placeholder="443" value="443">
-                        <div class="flex gap-2">
-                            <input type="text" id="gen-uuid" oninput="updateGen()" class="flex-1 bg-slate-900 border border-slate-700 rounded-2xl px-6 py-4 text-white font-mono text-xs" placeholder="UUID / Password">
-                            <button onclick="regenUUID()" class="bg-slate-800 hover:bg-slate-700 px-4 rounded-2xl text-sky-400 transition-all"><i class="fas fa-sync-alt"></i></button>
+        <section id="section-gen" class="hidden max-w-7xl mx-auto pb-20">
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-10">
+                <!-- Settings -->
+                <div class="glass p-8 rounded-[2.5rem] space-y-6 h-fit sticky top-0">
+                    <h3 class="text-2xl font-black flex items-center"><i class="fas fa-cog mr-4 text-sky-400"></i>Relay Settings</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="text-[10px] font-black uppercase text-slate-500 mb-2 block ml-2">Proxy Node (IP/Domain)</label>
+                            <input type="text" id="gen-host" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-5 py-4 text-white font-mono" placeholder="sg1.v2ray.com">
+                        </div>
+                        <div>
+                            <label class="text-[10px] font-black uppercase text-slate-500 mb-2 block ml-2">Port</label>
+                            <input type="number" id="gen-port" oninput="updateGen()" class="w-full bg-slate-900 border border-slate-700 rounded-2xl px-5 py-4 text-white font-mono" placeholder="443" value="443">
+                        </div>
+                        <div>
+                            <label class="text-[10px] font-black uppercase text-slate-500 mb-2 block ml-2">UUID / Password</label>
+                            <div class="flex gap-2">
+                                <input type="text" id="gen-uuid" oninput="updateGen()" class="flex-1 bg-slate-900 border border-slate-700 rounded-2xl px-5 py-4 text-white font-mono text-xs" placeholder="Auto-generated">
+                                <button onclick="regenUUID()" class="bg-slate-800 hover:bg-slate-700 px-4 rounded-2xl text-sky-400 transition-all shadow-lg"><i class="fas fa-sync-alt"></i></button>
+                            </div>
                         </div>
                     </div>
                 </div>
-                <div class="glass p-10 rounded-[3rem] flex flex-col items-center justify-center">
-                    <div id="gen-qrcode" class="bg-white p-6 rounded-[2.5rem] mb-8"></div>
-                    <div id="gen-link" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[10px] font-mono text-slate-400 break-all mb-4 h-20 overflow-y-auto">Enter host...</div>
-                    <button onclick="copyGenLink()" class="w-full bg-sky-600 hover:bg-sky-500 py-4 rounded-2xl font-black uppercase tracking-widest text-sm">Copy Link</button>
+
+                <!-- VLESS Result -->
+                <div class="glass p-8 rounded-[2.5rem] flex flex-col items-center border-t-4 border-t-sky-500">
+                    <div class="bg-sky-500 text-white px-6 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-8">VLESS Protocol</div>
+                    <div id="gen-qrcode-vless" class="bg-white p-5 rounded-[2rem] shadow-2xl mb-8"></div>
+                    <div id="gen-link-vless" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[9px] font-mono text-slate-400 break-all mb-6 w-full h-24 overflow-y-auto leading-relaxed">Enter host to generate...</div>
+                    <button onclick="copyLinkProtocol('vless')" class="w-full bg-sky-600 hover:bg-sky-500 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl shadow-sky-600/20 transition-all">Copy VLESS Link</button>
+                </div>
+
+                <!-- Trojan Result -->
+                <div class="glass p-8 rounded-[2.5rem] flex flex-col items-center border-t-4 border-t-indigo-500">
+                    <div class="bg-indigo-500 text-white px-6 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-8">Trojan Protocol</div>
+                    <div id="gen-qrcode-trojan" class="bg-white p-5 rounded-[2rem] shadow-2xl mb-8"></div>
+                    <div id="gen-link-trojan" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[9px] font-mono text-slate-400 break-all mb-6 w-full h-24 overflow-y-auto leading-relaxed">Enter host to generate...</div>
+                    <button onclick="copyLinkProtocol('trojan')" class="w-full bg-indigo-600 hover:bg-indigo-500 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl shadow-indigo-600/20 transition-all">Copy Trojan Link</button>
                 </div>
             </div>
         </section>
@@ -340,28 +357,37 @@ function generateDashboard(request) {
         }
 
         function updateGen() {
-            const proto = document.getElementById('gen-proto').value;
             const host = document.getElementById('gen-host').value.trim();
             const port = document.getElementById('gen-port').value || '443';
             const uuidField = document.getElementById('gen-uuid');
-            const display = document.getElementById('gen-link');
-            const qrContainer = document.getElementById('gen-qrcode');
+
+            const vlessDisplay = document.getElementById('gen-link-vless');
+            const trojanDisplay = document.getElementById('gen-link-trojan');
+            const vlessQR = document.getElementById('gen-qrcode-vless');
+            const trojanQR = document.getElementById('gen-qrcode-trojan');
 
             if (!uuidField.value) regenUUID();
             const uuid = uuidField.value;
 
             if (!host) {
-                display.innerText = 'Enter host...';
-                qrContainer.innerHTML = '';
+                vlessDisplay.innerText = 'Enter host...';
+                trojanDisplay.innerText = 'Enter host...';
+                vlessQR.innerHTML = '';
+                trojanQR.innerHTML = '';
                 return;
             }
 
             const path = encodeURIComponent('/' + host + ':' + port);
-            const link = \`\${proto}://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-Relay\`;
+            const vlessLink = \`vless://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-VLESS\`;
+            const trojanLink = \`trojan://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-Trojan\`;
 
-            display.innerText = link;
-            qrContainer.innerHTML = '';
-            new QRCode(qrContainer, { text: link, width: 200, height: 200 });
+            vlessDisplay.innerText = vlessLink;
+            trojanDisplay.innerText = trojanLink;
+
+            vlessQR.innerHTML = '';
+            trojanQR.innerHTML = '';
+            new QRCode(vlessQR, { text: vlessLink, width: 180, height: 180 });
+            new QRCode(trojanQR, { text: trojanLink, width: 180, height: 180 });
         }
 
         function regenUUID() {
@@ -373,7 +399,13 @@ function generateDashboard(request) {
             updateGen();
         }
 
-        function copyGenLink() { navigator.clipboard.writeText(document.getElementById('gen-link').innerText); addLog('Link copied', 'success'); }
+        function copyLinkProtocol(proto) {
+            const text = document.getElementById('gen-link-' + proto).innerText;
+            if (text.includes('://')) {
+                navigator.clipboard.writeText(text);
+                addLog(proto.toUpperCase() + ' link copied', 'success');
+            }
+        }
         function openModal(m) { document.getElementById(m+'-modal').classList.remove('hidden'); }
         function closeModal(m) { document.getElementById(m+'-modal').classList.add('hidden'); }
 
@@ -503,7 +535,7 @@ function generateDashboard(request) {
         function delSub(u) { subs = subs.filter(x => x !== u); saveSubs(); }
 
         refreshIP();
-        addLog('AIVPN Engine v2.5.1 started.', 'success');
+        addLog('AIVPN Engine v2.5.2 started.', 'success');
         render(); renderSubs();
 
         (async () => {
