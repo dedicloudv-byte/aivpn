@@ -1,5 +1,5 @@
 // AIVPN - Cloudflare Worker V2Ray Client Dashboard & Relay
-// v2.4.2 - Corrected VLESS protocol parsing & 1101 fixes
+// v2.4.4 - Fixed Trojan header parsing & stabilized streams
 
 import { connect } from 'cloudflare:sockets';
 
@@ -43,17 +43,25 @@ export default {
 };
 
 async function handleTestConnection(request) {
+  let socket;
   try {
     const { host, port } = await request.json();
-    const socket = connect({ hostname: host, port: parseInt(port) });
+    socket = connect({ hostname: host, port: parseInt(port) });
     const start = Date.now();
-    await socket.opened;
+
+    // 5s timeout for testing
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), 5000))
+    ]);
+
     const latency = Date.now() - start;
     socket.close();
     return new Response(JSON.stringify({ success: true, latency }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (err) {
+    if (socket) try { socket.close(); } catch(e) {}
     return new Response(JSON.stringify({ success: false, error: err.message }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -110,14 +118,17 @@ async function handleRelay(request, nauticaMatch) {
   const [client, server] = Object.values(webSocketPair);
   server.accept();
 
+  let tcpSocket;
   try {
-    const tcpSocket = connect({ hostname: targetHost, port: targetPort });
+    tcpSocket = connect({ hostname: targetHost, port: targetPort });
 
     const wsToTcp = new ReadableStream({
       start(controller) {
         server.addEventListener('message', (event) => controller.enqueue(event.data));
         server.addEventListener('close', () => controller.close());
-      }
+        server.addEventListener('error', (err) => controller.error(err));
+      },
+      cancel() { if (tcpSocket) tcpSocket.close(); }
     }).pipeTo(tcpSocket.writable);
 
     const tcpToWs = tcpSocket.readable.pipeTo(new WritableStream({
@@ -126,13 +137,12 @@ async function handleRelay(request, nauticaMatch) {
       abort() { server.close(); }
     }));
 
-    Promise.all([wsToTcp, tcpToWs]).catch(() => {
-      server.close();
-      tcpSocket.close();
-    });
+    wsToTcp.catch(() => {}).finally(() => { server.close(); if (tcpSocket) tcpSocket.close(); });
+    tcpToWs.catch(() => {}).finally(() => { server.close(); if (tcpSocket) tcpSocket.close(); });
 
   } catch (err) {
     server.close();
+    if (tcpSocket) tcpSocket.close();
   }
 
   return new Response(null, { status: 101, webSocket: client });
@@ -145,33 +155,39 @@ async function handleDirect(request, env) {
   server.accept();
 
   server.addEventListener('message', async (event) => {
+    let tcpSocket;
     try {
       const buffer = event.data;
       if (buffer.byteLength < 24) return;
 
       let address = '', port = 0, addressEnd = 0, version = 0;
+      const view = new DataView(buffer);
 
       if (url.pathname === '/trojan') {
           if (buffer.byteLength < 58) return;
-          const view = new DataView(buffer);
           const addressType = view.getUint8(59);
           let offset = 60;
           if (addressType === 1) {
+              if (buffer.byteLength < offset + 4) return;
               address = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4;
           } else if (addressType === 2) {
               const len = view.getUint8(offset); offset += 1;
+              if (buffer.byteLength < offset + len) return;
               address = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len;
           } else if (addressType === 3) {
+              if (buffer.byteLength < offset + 16) return;
               const ipv6 = [];
               for (let i = 0; i < 8; i++) { ipv6.push(view.getUint16(offset + i * 2).toString(16)); }
               address = ipv6.join(':'); offset += 16;
           }
+          if (buffer.byteLength < offset + 4) return; // 2 bytes Port + 2 bytes CRLF
           port = view.getUint16(offset);
-          addressEnd = offset + 2;
+          addressEnd = offset + 4;
       } else {
           version = new Uint8Array(buffer.slice(0, 1))[0];
           const optLength = new Uint8Array(buffer.slice(17, 18))[0];
-          const view = new DataView(buffer);
+
+          if (buffer.byteLength < 22 + optLength) return;
 
           // VLESS: [1]Version [16]UUID [1]OptLen [N]Options [1]CMD [2]Port [1]AddrType [M]Address
           const cmd = view.getUint8(18 + optLength);
@@ -180,11 +196,14 @@ async function handleDirect(request, env) {
           let offset = 22 + optLength;
 
           if (addressType === 1) {
+              if (buffer.byteLength < offset + 4) return;
               address = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4;
           } else if (addressType === 2) {
               const len = view.getUint8(offset); offset += 1;
+              if (buffer.byteLength < offset + len) return;
               address = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len;
           } else if (addressType === 3) {
+              if (buffer.byteLength < offset + 16) return;
               const ipv6 = [];
               for (let i = 0; i < 8; i++) { ipv6.push(view.getUint16(offset + i * 2).toString(16)); }
               address = ipv6.join(':'); offset += 16;
@@ -194,27 +213,33 @@ async function handleDirect(request, env) {
 
       if (!address || !port) throw new Error('Failed to parse address or port');
 
-      const tcpSocket = connect({ hostname: address, port: port });
+      tcpSocket = connect({ hostname: address, port: port });
       if (url.pathname !== '/trojan') server.send(new Uint8Array([version, 0]));
       const writer = tcpSocket.writable.getWriter();
       await writer.write(buffer.slice(addressEnd));
       writer.releaseLock();
 
-      tcpSocket.readable.pipeTo(new WritableStream({
+      const tcpToWs = tcpSocket.readable.pipeTo(new WritableStream({
         write(chunk) { if (server.readyState === 1) server.send(chunk); },
         close() { server.close(); },
         abort() { server.close(); }
-      })).catch(() => {});
+      }));
 
-      new ReadableStream({
+      const wsToTcp = new ReadableStream({
         start(controller) {
           server.addEventListener('message', (e) => controller.enqueue(e.data));
           server.addEventListener('close', () => controller.close());
-        }
-      }).pipeTo(tcpSocket.writable).catch(() => {});
+          server.addEventListener('error', (err) => controller.error(err));
+        },
+        cancel() { if (tcpSocket) tcpSocket.close(); }
+      }).pipeTo(tcpSocket.writable);
+
+      tcpToWs.catch(() => {}).finally(() => { server.close(); if (tcpSocket) tcpSocket.close(); });
+      wsToTcp.catch(() => {}).finally(() => { server.close(); if (tcpSocket) tcpSocket.close(); });
 
     } catch (e) {
       server.close();
+      if (tcpSocket) tcpSocket.close();
     }
   }, { once: true });
 
@@ -522,7 +547,12 @@ function generateDashboard(request) {
             const s = servers.find(x => x.id === id); if(!s) return;
             addLog(\`Initializing secure tunnel to \${s.alias}...\`);
             addLog(\`Connecting to \${s.host}:\${s.port}...\`);
-            activeId = id; localStorage.setItem('aivpn_act_v5', id); render();
+            activeId = id; localStorage.setItem('aivpn_act_v5', id);
+
+            // Mark as testing
+            s.latency = 'Testing...';
+            render();
+
             try {
                 const res = await fetch('/api/test', {
                     method: 'POST',
@@ -581,7 +611,7 @@ function generateDashboard(request) {
         function delSub(u) { subs = subs.filter(x => x !== u); saveSubs(); }
 
         refreshIP();
-        addLog('AIVPN Engine v2.4.2 started successfully.', 'success');
+        addLog('AIVPN Engine v2.4.4 started successfully.', 'success');
         render(); renderSubs();
     </script>
 </body>
