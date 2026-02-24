@@ -1,5 +1,5 @@
 // AIVPN - Cloudflare Worker V2Ray Client Dashboard & Relay
-// v2.5.2 - Multi-protocol Generator UI
+// v2.5.3 - Robustness Fixes for Error 1101
 
 import { connect } from 'cloudflare:sockets';
 
@@ -9,10 +9,12 @@ export default {
       const url = new URL(request.url);
       const upgradeHeader = request.headers.get('Upgrade');
 
+      // WebSocket Upgrade Handler
       if (upgradeHeader === 'websocket') {
         return await handleWebSocket(request, env);
       }
 
+      // API Endpoints
       if (url.pathname === '/api/myip') {
         const clientIP = request.headers.get('CF-Connecting-IP') || 'Unknown';
         return new Response(JSON.stringify({ ip: clientIP }), {
@@ -28,12 +30,18 @@ export default {
         return await handleFetchSubscription(request);
       }
 
+      // Root Dashboard
       return new Response(generateDashboard(request), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
     } catch (err) {
       console.error('Worker Error:', err);
-      return new Response(JSON.stringify({ error: err.message }), {
+      // Return detailed error for debugging if 1101 persists
+      return new Response(JSON.stringify({
+        error: 'Worker Exception',
+        message: err.message,
+        stack: err.stack
+      }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
       });
@@ -43,6 +51,7 @@ export default {
 
 async function handleTestConnection(request) {
   let socket;
+  let timeoutId;
   try {
     const { host, port } = await request.json();
     if (!host || isNaN(port)) throw new Error('Invalid host or port');
@@ -50,17 +59,27 @@ async function handleTestConnection(request) {
     socket = connect({ hostname: host, port: parseInt(port) });
     const start = Date.now();
 
+    // Improved timeout management
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error('Connection timeout')), 5000);
+    });
+
     await Promise.race([
       socket.opened,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), 5000))
+      timeoutPromise
     ]);
 
+    if (timeoutId) clearTimeout(timeoutId);
     const latency = Date.now() - start;
-    socket.close();
+
+    // Close cleanly
+    try { socket.close(); } catch(e) {}
+
     return new Response(JSON.stringify({ success: true, latency }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
     if (socket) try { socket.close(); } catch(e) {}
     return new Response(JSON.stringify({ success: false, error: err.message }), {
       headers: { 'Content-Type': 'application/json' }
@@ -70,17 +89,22 @@ async function handleTestConnection(request) {
 
 async function handleFetchSubscription(request) {
   const subUrl = new URL(request.url).searchParams.get('url');
+  if (!subUrl || !subUrl.startsWith('http')) {
+    return new Response('Invalid Subscription URL', { status: 400 });
+  }
+
   try {
     const response = await fetch(subUrl, {
       headers: { 'User-Agent': 'v2rayNG/1.8.5' }
     });
     let text = await response.text();
     try {
+      // Basic check for base64
       if (!text.includes('://')) text = atob(text.trim());
     } catch (e) {}
     return new Response(text, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
   } catch (err) {
-    return new Response('Error', { status: 500 });
+    return new Response('Fetch Error', { status: 500 });
   }
 }
 
@@ -90,7 +114,9 @@ async function handleWebSocket(request, env) {
   const isRelay = url.pathname.startsWith('/relay/') || nauticaMatch;
 
   const webSocketPair = new WebSocketPair();
-  const [client, server] = Object.values(webSocketPair);
+  const client = webSocketPair[0];
+  const server = webSocketPair[1];
+
   server.accept();
 
   let tcpSocket = null;
@@ -104,7 +130,9 @@ async function handleWebSocket(request, env) {
 
   const wsStream = new ReadableStream({
     start(controller) {
-      server.addEventListener('message', (event) => controller.enqueue(event.data));
+      server.addEventListener('message', (event) => {
+        if (event.data) controller.enqueue(event.data);
+      });
       server.addEventListener('close', () => controller.close());
       server.addEventListener('error', () => controller.close());
     }
@@ -139,7 +167,11 @@ async function handleWebSocket(request, env) {
           host = result.host;
           port = result.port;
           payload = result.payload;
-          if (url.pathname !== '/trojan') server.send(new Uint8Array([result.version, 0]));
+          // Send VLESS response
+          if (url.pathname !== '/trojan') {
+            const resp = new Uint8Array([result.version, 0]);
+            if (server.readyState === 1) server.send(resp);
+          }
         }
 
         if (!host || isNaN(port)) throw new Error('Target parse failed');
@@ -148,13 +180,17 @@ async function handleWebSocket(request, env) {
         remoteWriter = tcpSocket.writable.getWriter();
         await remoteWriter.write(payload);
 
+        // Pipe target to websocket
         tcpSocket.readable.pipeTo(new WritableStream({
-          write(c) { if (server.readyState === 1) server.send(c); },
+          write(c) {
+            if (server.readyState === 1) server.send(c);
+          },
           close() { closeAll(); },
           abort() { closeAll(); }
         })).catch(closeAll);
 
       } catch (err) {
+        console.error('Relay Error:', err.message);
         closeAll();
       }
     },
@@ -166,32 +202,73 @@ async function handleWebSocket(request, env) {
 }
 
 function parseV2RayHeader(buffer, isTrojan) {
+  // Validate buffer type and length
+  if (!(buffer instanceof ArrayBuffer) && !ArrayBuffer.isView(buffer)) return null;
   if (buffer.byteLength < 24) return null;
-  const view = new DataView(buffer);
+
+  const view = new DataView(buffer instanceof ArrayBuffer ? buffer : buffer.buffer, buffer.byteOffset, buffer.byteLength);
   let host = '', port = 0, offset = 0, version = 0;
 
   try {
     if (isTrojan) {
-      if (buffer.byteLength < 58) return null;
+      if (buffer.byteLength < 62) return null; // Pass(56) + CRLF(2) + Cmd(1) + Type(1) + Port(2)
       const addrType = view.getUint8(59);
       offset = 60;
-      if (addrType === 1) { host = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4; }
-      else if (addrType === 2) { const len = view.getUint8(offset); offset += 1; host = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len; }
-      else if (addrType === 3) { const ipv6 = []; for (let i = 0; i < 8; i++) ipv6.push(view.getUint16(offset + i * 2).toString(16)); host = ipv6.join(':'); offset += 16; }
+      if (addrType === 1) { // IPv4
+        if (buffer.byteLength < offset + 4 + 2) return null;
+        host = new Uint8Array(buffer.slice(offset, offset + 4)).join('.');
+        offset += 4;
+      }
+      else if (addrType === 2) { // Domain
+        const len = view.getUint8(offset);
+        offset += 1;
+        if (buffer.byteLength < offset + len + 2) return null;
+        host = new TextDecoder().decode(buffer.slice(offset, offset + len));
+        offset += len;
+      }
+      else if (addrType === 3) { // IPv6
+        if (buffer.byteLength < offset + 16 + 2) return null;
+        const ipv6 = [];
+        for (let i = 0; i < 8; i++) ipv6.push(view.getUint16(offset + i * 2).toString(16));
+        host = ipv6.join(':');
+        offset += 16;
+      }
       port = view.getUint16(offset);
-      offset += 4;
+      offset += 4; // Skip port(2) and trailing CRLF(2)
     } else {
       version = view.getUint8(0);
       const optLen = view.getUint8(17);
+      if (buffer.byteLength < 22 + optLen) return null;
+
       const addrType = view.getUint8(21 + optLen);
       port = view.getUint16(19 + optLen);
       offset = 22 + optLen;
-      if (addrType === 1) { host = new Uint8Array(buffer.slice(offset, offset + 4)).join('.'); offset += 4; }
-      else if (addrType === 2) { const len = view.getUint8(offset); offset += 1; host = new TextDecoder().decode(buffer.slice(offset, offset + len)); offset += len; }
-      else if (addrType === 3) { const ipv6 = []; for (let i = 0; i < 8; i++) ipv6.push(view.getUint16(offset + i * 2).toString(16)); host = ipv6.join(':'); offset += 16; }
+
+      if (addrType === 1) {
+        if (buffer.byteLength < offset + 4) return null;
+        host = new Uint8Array(buffer.slice(offset, offset + 4)).join('.');
+        offset += 4;
+      }
+      else if (addrType === 2) {
+        const len = view.getUint8(offset);
+        offset += 1;
+        if (buffer.byteLength < offset + len) return null;
+        host = new TextDecoder().decode(buffer.slice(offset, offset + len));
+        offset += len;
+      }
+      else if (addrType === 3) {
+        if (buffer.byteLength < offset + 16) return null;
+        const ipv6 = [];
+        for (let i = 0; i < 8; i++) ipv6.push(view.getUint16(offset + i * 2).toString(16));
+        host = ipv6.join(':');
+        offset += 16;
+      }
     }
     return { host, port, version, payload: buffer.slice(offset) };
-  } catch (e) { return null; }
+  } catch (e) {
+    console.error('Header Parse Exception:', e.message);
+    return null;
+  }
 }
 
 function generateDashboard(request) {
@@ -236,7 +313,7 @@ function generateDashboard(request) {
                 <p class="text-xs font-mono text-white truncate mb-1" id="client-ip-display">Detecting...</p>
                 <button onclick="refreshIP()" class="w-full bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-[10px] font-black uppercase mt-2">Refresh</button>
             </div>
-            <div class="mt-6 text-[9px] font-bold text-slate-600 text-center uppercase">AIVPN EDGE CORE v2.5.2</div>
+            <div class="mt-6 text-[9px] font-bold text-slate-600 text-center uppercase">AIVPN EDGE CORE v2.5.3</div>
         </div>
     </aside>
 
@@ -250,7 +327,6 @@ function generateDashboard(request) {
 
         <section id="section-gen" class="hidden max-w-7xl mx-auto pb-20">
             <div class="grid grid-cols-1 xl:grid-cols-3 gap-10">
-                <!-- Settings -->
                 <div class="glass p-8 rounded-[2.5rem] space-y-6 h-fit sticky top-0">
                     <h3 class="text-2xl font-black flex items-center"><i class="fas fa-cog mr-4 text-sky-400"></i>Relay Settings</h3>
                     <div class="space-y-4">
@@ -272,19 +348,17 @@ function generateDashboard(request) {
                     </div>
                 </div>
 
-                <!-- VLESS Result -->
                 <div class="glass p-8 rounded-[2.5rem] flex flex-col items-center border-t-4 border-t-sky-500">
                     <div class="bg-sky-500 text-white px-6 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-8">VLESS Protocol</div>
                     <div id="gen-qrcode-vless" class="bg-white p-5 rounded-[2rem] shadow-2xl mb-8"></div>
-                    <div id="gen-link-vless" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[9px] font-mono text-slate-400 break-all mb-6 w-full h-24 overflow-y-auto leading-relaxed">Enter host to generate...</div>
+                    <div id="gen-link-vless" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[9px] font-mono text-slate-400 break-all mb-6 w-full h-24 overflow-y-auto leading-relaxed">Enter host...</div>
                     <button onclick="copyLinkProtocol('vless')" class="w-full bg-sky-600 hover:bg-sky-500 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl shadow-sky-600/20 transition-all">Copy VLESS Link</button>
                 </div>
 
-                <!-- Trojan Result -->
                 <div class="glass p-8 rounded-[2.5rem] flex flex-col items-center border-t-4 border-t-indigo-500">
                     <div class="bg-indigo-500 text-white px-6 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-8">Trojan Protocol</div>
                     <div id="gen-qrcode-trojan" class="bg-white p-5 rounded-[2rem] shadow-2xl mb-8"></div>
-                    <div id="gen-link-trojan" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[9px] font-mono text-slate-400 break-all mb-6 w-full h-24 overflow-y-auto leading-relaxed">Enter host to generate...</div>
+                    <div id="gen-link-trojan" class="bg-slate-950/50 p-4 rounded-xl border border-slate-800 text-[9px] font-mono text-slate-400 break-all mb-6 w-full h-24 overflow-y-auto leading-relaxed">Enter host...</div>
                     <button onclick="copyLinkProtocol('trojan')" class="w-full bg-indigo-600 hover:bg-indigo-500 py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-xl shadow-indigo-600/20 transition-all">Copy Trojan Link</button>
                 </div>
             </div>
@@ -333,6 +407,7 @@ function generateDashboard(request) {
 
         function addLog(msg, type = 'info') {
             const container = document.getElementById('log-container');
+            if(!container) return;
             const time = new Date().toLocaleTimeString([], { hour12: false });
             const line = document.createElement('div');
             line.className = 'log-line';
@@ -345,35 +420,44 @@ function generateDashboard(request) {
 
         function showSection(s) {
             ['servers', 'gen', 'subs', 'logs'].forEach(x => {
-                document.getElementById('section-'+x).classList.add('hidden');
-                document.getElementById('nav-'+x).classList.remove('active');
+                const sec = document.getElementById('section-'+x);
+                const nav = document.getElementById('nav-'+x);
+                if(sec) sec.classList.add('hidden');
+                if(nav) nav.classList.remove('active');
             });
-            document.getElementById('section-'+s).classList.remove('hidden');
-            document.getElementById('nav-'+s).classList.add('active');
+            const targetSec = document.getElementById('section-'+s);
+            const targetNav = document.getElementById('nav-'+s);
+            if(targetSec) targetSec.classList.remove('hidden');
+            if(targetNav) targetNav.classList.add('active');
+
             const titles = { servers: 'Servers', gen: 'Generator', subs: 'Subscriptions', logs: 'Live Console' };
             const descs = { servers: 'Your private gateway to the global internet', gen: 'Quickly generate relay configurations', subs: 'Manage your remote config feeds', logs: 'Real-time monitoring' };
-            document.getElementById('title').innerText = titles[s];
-            document.getElementById('desc').innerText = descs[s];
+            document.getElementById('title').innerText = titles[s] || 'AIVPN';
+            document.getElementById('desc').innerText = descs[s] || '';
+            if(s === 'gen') updateGen();
         }
 
         function updateGen() {
-            const host = document.getElementById('gen-host').value.trim();
-            const port = document.getElementById('gen-port').value || '443';
+            const hostField = document.getElementById('gen-host');
+            const portField = document.getElementById('gen-port');
             const uuidField = document.getElementById('gen-uuid');
+            if(!hostField) return;
+
+            const host = hostField.value.trim();
+            const port = portField.value || '443';
+            if (!uuidField.value) regenUUID();
+            const uuid = uuidField.value;
 
             const vlessDisplay = document.getElementById('gen-link-vless');
             const trojanDisplay = document.getElementById('gen-link-trojan');
             const vlessQR = document.getElementById('gen-qrcode-vless');
             const trojanQR = document.getElementById('gen-qrcode-trojan');
 
-            if (!uuidField.value) regenUUID();
-            const uuid = uuidField.value;
-
             if (!host) {
-                vlessDisplay.innerText = 'Enter host...';
-                trojanDisplay.innerText = 'Enter host...';
-                vlessQR.innerHTML = '';
-                trojanQR.innerHTML = '';
+                if(vlessDisplay) vlessDisplay.innerText = 'Enter host...';
+                if(trojanDisplay) trojanDisplay.innerText = 'Enter host...';
+                if(vlessQR) vlessQR.innerHTML = '';
+                if(trojanQR) trojanQR.innerHTML = '';
                 return;
             }
 
@@ -381,13 +465,17 @@ function generateDashboard(request) {
             const vlessLink = \`vless://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-VLESS\`;
             const trojanLink = \`trojan://\${uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${path}#AIVPN-Trojan\`;
 
-            vlessDisplay.innerText = vlessLink;
-            trojanDisplay.innerText = trojanLink;
+            if(vlessDisplay) vlessDisplay.innerText = vlessLink;
+            if(trojanDisplay) trojanDisplay.innerText = trojanLink;
 
-            vlessQR.innerHTML = '';
-            trojanQR.innerHTML = '';
-            new QRCode(vlessQR, { text: vlessLink, width: 180, height: 180 });
-            new QRCode(trojanQR, { text: trojanLink, width: 180, height: 180 });
+            if(vlessQR) {
+                vlessQR.innerHTML = '';
+                new QRCode(vlessQR, { text: vlessLink, width: 180, height: 180 });
+            }
+            if(trojanQR) {
+                trojanQR.innerHTML = '';
+                new QRCode(trojanQR, { text: trojanLink, width: 180, height: 180 });
+            }
         }
 
         function regenUUID() {
@@ -395,25 +483,30 @@ function generateDashboard(request) {
                 const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
                 return v.toString(16);
             });
-            document.getElementById('gen-uuid').value = uuid;
-            updateGen();
+            const field = document.getElementById('gen-uuid');
+            if(field) {
+                field.value = uuid;
+                updateGen();
+            }
         }
 
         function copyLinkProtocol(proto) {
-            const text = document.getElementById('gen-link-' + proto).innerText;
-            if (text.includes('://')) {
-                navigator.clipboard.writeText(text);
+            const el = document.getElementById('gen-link-' + proto);
+            if (el && el.innerText.includes('://')) {
+                navigator.clipboard.writeText(el.innerText);
                 addLog(proto.toUpperCase() + ' link copied', 'success');
             }
         }
-        function openModal(m) { document.getElementById(m+'-modal').classList.remove('hidden'); }
-        function closeModal(m) { document.getElementById(m+'-modal').classList.add('hidden'); }
+        function openModal(m) { const el = document.getElementById(m+'-modal'); if(el) el.classList.remove('hidden'); }
+        function closeModal(m) { const el = document.getElementById(m+'-modal'); if(el) el.classList.add('hidden'); }
 
         async function refreshIP() {
             const display = document.getElementById('client-ip-display');
+            if(!display) return;
             display.innerText = 'Detecting...';
             try {
                 const res = await fetch('/api/myip');
+                if(!res.ok) throw new Error('API Error');
                 const data = await res.json();
                 display.innerText = data.ip;
                 addLog(\`IP Identity verified: \${data.ip}\`, 'success');
@@ -435,30 +528,35 @@ function generateDashboard(request) {
         }
 
         function doImport() {
-            const lines = document.getElementById('import-text').value.split('\\n');
+            const area = document.getElementById('import-text');
+            if(!area) return;
+            const lines = area.value.split('\\n');
             let count = 0;
             lines.forEach(l => { const c = parse(l.trim()); if(c) { servers.push(c); count++; } });
             if (count) { addLog(\`Imported \${count} config(s)\`, 'success'); save(); closeModal('import'); render(); }
         }
 
         async function addSubscription() {
-            const url = document.getElementById('sub-input').value.trim();
+            const input = document.getElementById('sub-input');
+            const url = input ? input.value.trim() : '';
             if(!url) return;
             addLog(\`Feed: \${url}\`);
             try {
                 const res = await fetch(\`/api/sub?url=\${encodeURIComponent(url)}\`);
+                if(!res.ok) throw new Error('Subscription load failed');
                 const text = await res.text();
                 let count = 0;
                 text.split('\\n').forEach(l => { const c = parse(l.trim()); if(c) { servers.push(c); count++; } });
                 if(!subs.includes(url)) subs.push(url);
                 addLog(\`Success: \${count} servers loaded\`, 'success');
                 save(); saveSubs(); render();
-                document.getElementById('sub-input').value = '';
+                if(input) input.value = '';
             } catch (e) { addLog(\`Error: \${e.message}\`, 'error'); }
         }
 
         function render() {
             const c = document.getElementById('section-servers');
+            if(!c) return;
             c.innerHTML = servers.length ? '' : '<div class="col-span-full py-32 text-center text-slate-700 border-4 border-dashed border-slate-800/40 rounded-[3rem] font-bold">No accounts found.</div>';
             servers.forEach(s => {
                 const isConn = s.id === activeId;
@@ -509,7 +607,7 @@ function generateDashboard(request) {
         }
 
         function qr(id) {
-            const s = servers.find(x => x.id === id);
+            const s = servers.find(x => x.id === id); if(!s) return;
             const link = \`\${s.protocol}://\${s.uuid}@\${workerHost}:443?security=tls&type=ws&host=\${workerHost}&sni=\${workerHost}&path=\${encodeURIComponent('/relay/'+s.host+'/'+s.port)}#AIVPN-\${s.alias}\`;
             document.getElementById('qr-name').innerText = s.alias;
             document.getElementById('qr-link').innerText = link;
@@ -518,12 +616,17 @@ function generateDashboard(request) {
             openModal('qr');
         }
 
-        function copyLink() { navigator.clipboard.writeText(document.getElementById('qr-link').innerText); addLog('Copied', 'success'); }
+        function copyLink() {
+            const link = document.getElementById('qr-link').innerText;
+            navigator.clipboard.writeText(link);
+            addLog('Copied to clipboard', 'success');
+        }
         function save() { localStorage.setItem('aivpn_srv_v5', JSON.stringify(servers)); }
         function saveSubs() { localStorage.setItem('aivpn_sub_v5', JSON.stringify(subs)); renderSubs(); }
         function del(id) { servers = servers.filter(x => x.id !== id); if(activeId === id) activeId = null; save(); render(); }
         function renderSubs() {
             const c = document.getElementById('sub-list');
+            if(!c) return;
             c.innerHTML = '';
             subs.forEach(u => {
                 const d = document.createElement('div');
@@ -535,13 +638,14 @@ function generateDashboard(request) {
         function delSub(u) { subs = subs.filter(x => x !== u); saveSubs(); }
 
         refreshIP();
-        addLog('AIVPN Engine v2.5.2 started.', 'success');
+        addLog('AIVPN Engine v2.5.3 initialized.', 'success');
         render(); renderSubs();
 
+        // Throttled background pings
         (async () => {
             for (let s of servers) {
                 await ping(s.id);
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, 500));
             }
         })();
     </script>
